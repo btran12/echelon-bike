@@ -461,7 +461,7 @@ let awsEndpoint=localStorage.getItem('echelon_aws_endpoint')||'';
 let userId=localStorage.getItem('echelon_user_id')||'rider';
 let sessions=JSON.parse(localStorage.getItem('echelon_sessions')||'[]');
 let bleDevice=null,bleChar=null,bleWriteChar=null,isConnected=false;
-let blePollingInterval=null;
+let blePollingInterval=null,bleKeepaliveInterval=null;
 let lastValidDataTime=0;
 let cadence=0,resistance=0,power=0,totalDist=0,startTime=null,timerInt=null;
 let currentSessionData=[],rawByteLogCount=0;
@@ -609,29 +609,36 @@ async function handleConnectClick(){
     
     bleChar=notifyChars[0];  // Keep reference to first one
     
-    // Start gentle polling to request cadence updates
-    // Faster interval (1s) to catch 8-byte packets more reliably
-    if(blePollingInterval)clearInterval(blePollingInterval);
-    blePollingInterval=setInterval(async ()=>{
-      if(!bleChar || !isConnected)return;
+    // Start keep-alive interval to prevent bike disconnect
+    // Send periodic activation packets to show we're active
+    if(bleKeepaliveInterval)clearInterval(bleKeepaliveInterval);
+    bleKeepaliveInterval=setInterval(async ()=>{
+      if(!bleWriteChar || !isConnected)return;
       try{
-        const val=await bleChar.readValue();
-        // Process the read value through the handler
-        handleBLEData({target:{value:val}});
+        // Send first activation packet to maintain connection
+        await bleWriteChar.writeValue(ACTIVATION_PACKETS[0]);
+        log('[KeepAlive] Sent to maintain connection','debug');
       }catch(e){
-        // Silently fail on read errors
+        // Connection lost - will be handled by gattserverdisconnected event
       }
-    },1000);  // Every 1 second
-    log('Polling enabled (1s interval) for cadence updates.','info');
+    },30000);  // Every 30 seconds
+    log('Keep-alive enabled (30s interval).','info');
     
+    // Find write characteristic for keep-alive packets
+    if(!foundWriteChar){
+      for(const u of ECHELON_WRITE_UUIDS){
+        const m=allChars.find(c=>c.uuid===u&&(c.properties.write||c.properties.writeWithoutResponse));
+        if(m){foundWriteChar=m;break;}
+      }
+    }
     if(foundWriteChar){
       bleWriteChar=foundWriteChar;
-      // Try activation but don't let failures break the connection
+      // Send initial activation packet
       let activationSent=false;
       for(const pkt of ACTIVATION_PACKETS){
         try{
           await bleWriteChar.writeValue(pkt);
-          log('Activation packet sent.','ok');
+          log('Initial activation packet sent.','ok');
           activationSent=true;
           break;
         }catch(e){
@@ -639,8 +646,10 @@ async function handleConnectClick(){
         }
       }
       if(!activationSent){
-        log('Activation packets failed, continuing anyway.','info');
+        log('Activation packets failed, but will retry via keep-alive.','info');
       }
+    }else{
+      log('No write characteristic found - keep-alive may not work.','warn');
     }
     
     isConnected=true; setBleState('connected');
@@ -742,6 +751,7 @@ function onDisconnected(){
   setBleState('idle'); 
   clearInterval(timerInt);
   if(blePollingInterval){clearInterval(blePollingInterval);blePollingInterval=null;}
+  if(bleKeepaliveInterval){clearInterval(bleKeepaliveInterval);bleKeepaliveInterval=null;}
   if(bleChar){
     try{
       bleChar.stopNotifications();
@@ -753,6 +763,7 @@ function onDisconnected(){
 }
 function disconnectBike(){ 
   if(blePollingInterval){clearInterval(blePollingInterval);blePollingInterval=null;}
+  if(bleKeepaliveInterval){clearInterval(bleKeepaliveInterval);bleKeepaliveInterval=null;}
   if(bleDevice&&bleDevice.gatt.connected)bleDevice.gatt.disconnect(); 
 }
 
