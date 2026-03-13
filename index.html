@@ -654,25 +654,21 @@ function handleBLEData(event){
   
   let parsed=false,parseReason='',extractedCad=0,extractedRes=0;
   
-  // Sport 030107 8-byte format: f0 e0 [res] ... [cad] ...
-  // f0 e0 33 69 57 56 12 2b
-  // [2]=0x33(51)=resistance, [5]=0x56(86)=cadence
+  // Sport 030107 8-byte format: f0 e0 ...
+  // f0 e0 86 56 01 80 28 55
+  // [3]=0x56(86)=cadence, [6]=0x28(40)=resistance
   if(bytes.length===8&&bytes[0]===0xf0&&bytes[1]===0xe0){
-    extractedRes=bytes[2];
-    extractedCad=bytes[5];
+    extractedCad=bytes[3];
+    extractedRes=bytes[6];
     parsed=true;
     parseReason='8b-f0e0';
   }
-  // 5-byte format: f0 d2 [?] [res] [cad]
+  // 5-byte format: f0 d2 [?] [?] [?]
   // f0 d2 01 12 d5
-  // [3]=0x12(18)=resistance, [4]=0xd5(213)?? or [2]=0x01?
-  // Try: [3] is resistance, [4] isn't cadence (too high)
-  // Maybe [2] combined with something or unparsed as-is?
+  // Need to find where cadence and resistance are - try [3] and [4]
   else if(bytes.length===5&&bytes[0]===0xf0&&bytes[1]===0xd2){
-    extractedRes=bytes[3];
-    // For cadence, try different positions - could be [2], [4], or combined
-    // Start with [2] as single byte
-    extractedCad=bytes[2];
+    extractedCad=bytes[3];
+    extractedRes=bytes[2];
     parsed=true;
     parseReason='5b-f0d2';
   }
@@ -703,8 +699,8 @@ function handleBLEData(event){
   // Skip zero-data status packets
   if(extractedCad===0&&extractedRes===0&&parseReason.includes('d1'))return;
   
-  // Sanity check - cadence should be reasonable RPM, resistance 0-32 or 0-100
-  if(extractedCad>200){log('  ✗ '+parseReason+' cad:'+extractedCad+' unreasonable','info');return;}
+  // Sanity check - cadence should be reasonable RPM (30-200), resistance 0-100
+  if(extractedCad>200||extractedCad<5){log('  ✗ '+parseReason+' cad:'+extractedCad+' unreasonable','info');return;}
   if(extractedRes>100){log('  ✗ '+parseReason+' res:'+extractedRes+' too high','info');return;}
   
   cadence=extractedCad;
