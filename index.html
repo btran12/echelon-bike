@@ -649,16 +649,59 @@ function handleBLEData(event){
   const hexStr=Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join(' ');
   if(rawByteLogCount<10){log('RAW ['+bytes.length+'b]: '+hexStr,'data');rawByteLogCount++;}
   if(bytes.length<4){log('  → rejected: too short (<4 bytes)','info');return;}
-  let parsed=false,parseReason='';
-  if(bytes[1]===0xD1&&bytes.length>=10){cadence=bytes[9];resistance=bytes[3];parsed=true;parseReason='Pattern D1 (10b)';}
-  else if(bytes[1]===0xD1&&bytes.length>=8){cadence=bytes[7];resistance=bytes[3];parsed=true;parseReason='Pattern D1 (8b)';}
-  else if(bytes[0]===0xF6&&bytes.length>=5){cadence=(bytes[2]<<8)|bytes[3];resistance=bytes[4];parsed=true;parseReason='Pattern F6';}
-  else if(bytes.length>=3&&bytes[0]>=0xF0){cadence=bytes[1];resistance=bytes[2];parsed=true;parseReason='Pattern F0+ generic';}
-  else {log('  → rejected: no pattern match','info');return;}
   
-  if(!parsed){log('  → rejected: parse failed','info');return;}
-  if(cadence>200){log('  → rejected: cadence '+cadence+' > 200','info');return;}
-  if(resistance>32){log('  → rejected: resistance '+resistance+' > 32','info');return;}
+  let parsed=false,parseReason='',extractedCad=0,extractedRes=0;
+  
+  // Sport 030107 8-byte format: f0 e0 22 44 33 78 06 e7
+  // Byte 5 appears to be cadence (0x78=120), byte 6 appears to be resistance (0x06=6)
+  if(bytes.length===8&&bytes[0]===0xf0&&bytes[1]===0xe0){
+    extractedCad=bytes[5];
+    extractedRes=bytes[6];
+    parsed=true;
+    parseReason='Sport8b format';
+  }
+  // Standard D1 format (13-byte): f0 d1 09 00 00 00... (or sometimes with data at pos 7,9)
+  else if(bytes[1]===0xd1&&bytes.length>=10){
+    extractedCad=bytes[9];
+    extractedRes=bytes[3];
+    parsed=true;
+    parseReason='Pattern D1 (10b)';
+  }
+  else if(bytes[1]===0xd1&&bytes.length>=8){
+    extractedCad=bytes[7];
+    extractedRes=bytes[3];
+    parsed=true;
+    parseReason='Pattern D1 (8b)';
+  }
+  // F6 format
+  else if(bytes[0]===0xf6&&bytes.length>=5){
+    extractedCad=(bytes[2]<<8)|bytes[3];
+    extractedRes=bytes[4];
+    parsed=true;
+    parseReason='Pattern F6';
+  }
+  // Generic F0+ format
+  else if(bytes.length>=3&&bytes[0]>=0xf0){
+    extractedCad=bytes[1];
+    extractedRes=bytes[2];
+    parsed=true;
+    parseReason='Pattern F0+ generic';
+  }
+  
+  if(!parsed){log('  → rejected: no pattern match','info');return;}
+  
+  // Validation
+  if(extractedCad>250){log('  → rejected: cadence '+extractedCad+' > 250','info');return;}
+  if(extractedRes>33){log('  → rejected: resistance '+extractedRes+' > 33','info');return;}
+  
+  cadence=extractedCad;
+  resistance=extractedRes;
+  
+  // Skip logging zero/status packets unless we're validating
+  if(cadence===0&&resistance===0&&parseReason.includes('D1')){
+    // quietly skip zero packets
+    return;
+  }
   
   log('  ✓ '+parseReason+' → cad:'+cadence+' res:'+resistance,'ok');
   power=cadence>0?Math.round(1.09*Math.pow(cadence,0.967)*Math.pow(Math.max(resistance,1),0.191)):0;
