@@ -668,9 +668,9 @@ function handleBLEData(event){
     
     // Sport 030107 8-byte format: f0 e0 ...
     // f0 e0 14 29 10 64 83 04
-    // [5]=0x64(100)=cadence only
+    // [3]=0x29(41)=cadence (40-60 range)
     if(bytes.length===8&&bytes[0]===0xf0&&bytes[1]===0xe0){
-      extractedCad=bytes[5];
+      extractedCad=bytes[3];
       extractedRes=resistance;  // Keep last known resistance
       parsed=true;
       parseReason='8b-f0e0-cad';
