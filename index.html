@@ -609,8 +609,8 @@ async function handleConnectClick(){
     
     bleChar=notifyChars[0];  // Keep reference to first one
     
-    // Start very gentle polling to request cadence updates
-    // Longer interval (5s) to avoid overwhelming the device
+    // Start gentle polling to request cadence updates
+    // Faster interval (1s) to catch 8-byte packets more reliably
     if(blePollingInterval)clearInterval(blePollingInterval);
     blePollingInterval=setInterval(async ()=>{
       if(!bleChar || !isConnected)return;
@@ -621,8 +621,8 @@ async function handleConnectClick(){
       }catch(e){
         // Silently fail on read errors
       }
-    },5000);  // Every 5 seconds - very gentle
-    log('Polling enabled (5s interval) for cadence updates.','info');
+    },1000);  // Every 1 second
+    log('Polling enabled (1s interval) for cadence updates.','info');
     
     if(foundWriteChar){
       bleWriteChar=foundWriteChar;
@@ -655,12 +655,14 @@ function handleBLEData(event){
   try{
     const bytes=new Uint8Array(event.target.value.buffer);
     const hexStr=Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join(' ');
-    if(rawByteLogCount<20){
+    // Log LOTS of raw packets so user can see the pattern
+    if(rawByteLogCount<100){
       const byteInfo=[];
-      for(let i=0;i<bytes.length;i++){  // Show ALL bytes, not just first 8
-        byteInfo.push(`[${i}]=0x${bytes[i].toString(16).padStart(2,'0')}(${bytes[i]})`);
+      for(let i=0;i<bytes.length;i++){
+        byteInfo.push(`[${i}]=0x${bytes[i].toString(16).padStart(2,'0')}=${bytes[i]}`);
       }
-      log('RAW ['+bytes.length+'b]: '+hexStr+'  '+byteInfo.join(' '),'data');
+      log('RAW ['+bytes.length+'b]: '+hexStr, 'data');
+      log('      '+byteInfo.join(' | '), 'data');
       rawByteLogCount++;
     }
     if(bytes.length<3)return;
