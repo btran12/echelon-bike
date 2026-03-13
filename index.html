@@ -647,18 +647,35 @@ async function handleConnectClick(){
 function handleBLEData(event){
   const bytes=new Uint8Array(event.target.value.buffer);
   const hexStr=Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join(' ');
-  if(rawByteLogCount<10){log('RAW ['+bytes.length+'b]: '+hexStr,'data');rawByteLogCount++;}
+  if(rawByteLogCount<10){
+    const byteInfo=[];
+    for(let i=0;i<Math.min(8,bytes.length);i++){
+      byteInfo.push(`[${i}]=0x${bytes[i].toString(16).padStart(2,'0')}(${bytes[i]})`);
+    }
+    log('RAW ['+bytes.length+'b]: '+hexStr+'  '+byteInfo.join(' '),'data');
+    rawByteLogCount++;
+  }
   if(bytes.length<4){log('  → rejected: too short (<4 bytes)','info');return;}
   
   let parsed=false,parseReason='',extractedCad=0,extractedRes=0;
   
-  // Sport 030107 8-byte format: f0 e0 22 44 33 78 06 e7
-  // Byte 5 appears to be cadence (0x78=120), byte 6 appears to be resistance (0x06=6)
+  // Sport 030107 8-byte format: try different byte positions
+  // f0 e0 66 61 58 73 67 c9
+  // f0 e0 22 44 33 78 06 e7
+  // Try: cadence at [2], resistance from lower bits of [3]
   if(bytes.length===8&&bytes[0]===0xf0&&bytes[1]===0xe0){
-    extractedCad=bytes[5];
-    extractedRes=bytes[6];
+    extractedCad=bytes[2];
+    extractedRes=bytes[3]&0x1F;  // Lower 5 bits for 0-31 range
+    // If that gives 0 res, try position 4
+    if(extractedRes===0 && bytes[4]<=32){
+      extractedRes=bytes[4];
+    }
+    // If still 0 or unreasonable, try position 5 lower bits
+    if(extractedRes===0 || extractedRes>32){
+      extractedRes=bytes[5]&0x1F;
+    }
     parsed=true;
-    parseReason='Sport8b format';
+    parseReason='Sport8b (cad=[2], res=[3]&0x1F)';
   }
   // Standard D1 format (13-byte): f0 d1 09 00 00 00... (or sometimes with data at pos 7,9)
   else if(bytes[1]===0xd1&&bytes.length>=10){
