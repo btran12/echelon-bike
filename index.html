@@ -654,9 +654,9 @@ function handleBLEData(event){
   try{
     const bytes=new Uint8Array(event.target.value.buffer);
     const hexStr=Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join(' ');
-    if(rawByteLogCount<15){
+    if(rawByteLogCount<20){
       const byteInfo=[];
-      for(let i=0;i<Math.min(8,bytes.length);i++){
+      for(let i=0;i<bytes.length;i++){  // Show ALL bytes, not just first 8
         byteInfo.push(`[${i}]=0x${bytes[i].toString(16).padStart(2,'0')}(${bytes[i]})`);
       }
       log('RAW ['+bytes.length+'b]: '+hexStr+'  '+byteInfo.join(' '),'data');
@@ -675,14 +675,14 @@ function handleBLEData(event){
       parsed=true;
       parseReason='8b-f0e0-cad';
     }
-    // 5-byte format: f0 d2 - contains resistance data
+    // 5-byte format: f0 d2 - resistance updates
     // f0 d2 01 12 d5
-    // [3]=0x12(18)=resistance
+    // [3]=0x12(18)=resistance, cadence from 8b packets
     else if(bytes.length===5&&bytes[0]===0xf0&&bytes[1]===0xd2){
       extractedRes=bytes[3];
-      extractedCad=cadence;  // Keep last known cadence
+      extractedCad=cadence;  // Keep cadence from 8-byte packets
       parsed=true;
-      parseReason='5b-f0d2-res';
+      parseReason='5b-f0d2';
     }
     // 13-byte D1 format
     else if(bytes.length>=10&&bytes[0]===0xf0&&bytes[1]===0xd1){
