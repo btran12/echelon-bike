@@ -611,9 +611,12 @@ async function handleConnectClick(){
     try{
       await bleChar.startNotifications();
       log('Notifications enabled.','ok');
-    }catch(e){log('Notifications not supported, trying polling: '+e.message,'info');}
-    
-    bleChar.addEventListener('characteristicvaluechanged',handleBLEData);
+      bleChar.addEventListener('characteristicvaluechanged',handleBLEData);
+    }catch(e){
+      log('Notifications failed: '+e.message+' (trying without notifications)','warn');
+      // Still add listener in case it works
+      bleChar.addEventListener('characteristicvaluechanged',handleBLEData);
+    }
     
     // Don't poll - notifications are working fine and polling causes disconnections
     if(blePollingInterval)clearInterval(blePollingInterval);
@@ -622,12 +625,20 @@ async function handleConnectClick(){
     
     if(foundWriteChar){
       bleWriteChar=foundWriteChar;
+      // Try activation but don't let failures break the connection
+      let activationSent=false;
       for(const pkt of ACTIVATION_PACKETS){
         try{
           await bleWriteChar.writeValue(pkt);
           log('Activation packet sent.','ok');
+          activationSent=true;
           break;
-        }catch(e){log('Activation failed: '+e.message,'info');}
+        }catch(e){
+          log('Activation attempt failed: '+e.message,'info');
+        }
+      }
+      if(!activationSent){
+        log('Activation packets failed, continuing anyway.','info');
       }
     }
     
@@ -640,91 +651,98 @@ async function handleConnectClick(){
 }
 
 function handleBLEData(event){
-  const bytes=new Uint8Array(event.target.value.buffer);
-  const hexStr=Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join(' ');
-  if(rawByteLogCount<15){
-    const byteInfo=[];
-    for(let i=0;i<Math.min(8,bytes.length);i++){
-      byteInfo.push(`[${i}]=0x${bytes[i].toString(16).padStart(2,'0')}(${bytes[i]})`);
+  try{
+    const bytes=new Uint8Array(event.target.value.buffer);
+    const hexStr=Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+    if(rawByteLogCount<15){
+      const byteInfo=[];
+      for(let i=0;i<Math.min(8,bytes.length);i++){
+        byteInfo.push(`[${i}]=0x${bytes[i].toString(16).padStart(2,'0')}(${bytes[i]})`);
+      }
+      log('RAW ['+bytes.length+'b]: '+hexStr+'  '+byteInfo.join(' '),'data');
+      rawByteLogCount++;
     }
-    log('RAW ['+bytes.length+'b]: '+hexStr+'  '+byteInfo.join(' '),'data');
-    rawByteLogCount++;
+    if(bytes.length<3)return;
+    
+    let parsed=false,parseReason='',extractedCad=0,extractedRes=0;
+    
+    // Sport 030107 8-byte format: f0 e0 ...
+    // f0 e0 86 56 01 80 28 55
+    // [3]=0x56(86)=resistance, [6]=0x28(40)=cadence
+    if(bytes.length===8&&bytes[0]===0xf0&&bytes[1]===0xe0){
+      extractedCad=bytes[6];
+      extractedRes=bytes[3];
+      parsed=true;
+      parseReason='8b-f0e0';
+    }
+    // 5-byte format: f0 d2 [?] [?] [?]
+    // f0 d2 01 12 d5
+    // Need to find where cadence and resistance are - try [3] and [4]
+    else if(bytes.length===5&&bytes[0]===0xf0&&bytes[1]===0xd2){
+      extractedCad=bytes[3];
+      extractedRes=bytes[2];
+      parsed=true;
+      parseReason='5b-f0d2';
+    }
+    // 13-byte D1 format
+    else if(bytes.length>=10&&bytes[0]===0xf0&&bytes[1]===0xd1){
+      extractedCad=bytes[9];
+      extractedRes=bytes[3];
+      parsed=true;
+      parseReason='13b-d1';
+    }
+    // 8-byte D1 format
+    else if(bytes.length===8&&bytes[0]===0xf0&&bytes[1]===0xd1){
+      extractedCad=bytes[7];
+      extractedRes=bytes[3];
+      parsed=true;
+      parseReason='8b-d1';
+    }
+    // F6 format (less common)
+    else if(bytes.length===5&&bytes[0]===0xf6){
+      extractedCad=(bytes[2]<<8)|bytes[3];
+      extractedRes=bytes[4];
+      parsed=true;
+      parseReason='5b-f6';
+    }
+    
+    if(!parsed)return;
+    
+    // Skip zero-data status packets
+    if(extractedCad===0&&extractedRes===0&&parseReason.includes('d1'))return;
+    
+    // Sanity check - cadence should be reasonable RPM (30-200), resistance 0-100
+    if(extractedCad>200||extractedCad<5){log('  ✗ '+parseReason+' cad:'+extractedCad+' unreasonable','info');return;}
+    if(extractedRes>100){log('  ✗ '+parseReason+' res:'+extractedRes+' too high','info');return;}
+    
+    cadence=extractedCad;
+    resistance=extractedRes;
+    lastValidDataTime=Date.now();
+    
+    log('  ✓ '+parseReason+' → cad:'+cadence+' res:'+resistance,'ok');
+    power=cadence>0?Math.round(1.09*Math.pow(cadence,0.967)*Math.pow(Math.max(resistance,1),0.191)):0;
+    const speed=Math.round(cadence*0.38*10)/10;
+    document.getElementById('valCadence').textContent=cadence;
+    document.getElementById('valResistance').textContent=resistance;
+    document.getElementById('valPower').textContent=power;
+    document.getElementById('valSpeed').innerHTML=speed.toFixed(1)+'<span class="sm-unit"> mph</span>';
+    totalDist+=(speed/3600)*(1/10);
+    document.getElementById('valDist').innerHTML=totalDist.toFixed(2)+'<span class="sm-unit"> mi</span>';
+    pushLiveChart(cadence,resistance);
+    currentSessionData.push({t:Date.now(),c:cadence,r:resistance,p:power,s:speed});
+  }catch(e){
+    log('Error processing BLE data: '+e.message,'err');
   }
-  if(bytes.length<3)return;
-  
-  let parsed=false,parseReason='',extractedCad=0,extractedRes=0;
-  
-  // Sport 030107 8-byte format: f0 e0 ...
-  // f0 e0 86 56 01 80 28 55
-  // [3]=0x56(86)=cadence, [6]=0x28(40)=resistance
-  if(bytes.length===8&&bytes[0]===0xf0&&bytes[1]===0xe0){
-    extractedCad=bytes[3];
-    extractedRes=bytes[6];
-    parsed=true;
-    parseReason='8b-f0e0';
-  }
-  // 5-byte format: f0 d2 [?] [?] [?]
-  // f0 d2 01 12 d5
-  // Need to find where cadence and resistance are - try [3] and [4]
-  else if(bytes.length===5&&bytes[0]===0xf0&&bytes[1]===0xd2){
-    extractedCad=bytes[3];
-    extractedRes=bytes[2];
-    parsed=true;
-    parseReason='5b-f0d2';
-  }
-  // 13-byte D1 format
-  else if(bytes.length>=10&&bytes[0]===0xf0&&bytes[1]===0xd1){
-    extractedCad=bytes[9];
-    extractedRes=bytes[3];
-    parsed=true;
-    parseReason='13b-d1';
-  }
-  // 8-byte D1 format
-  else if(bytes.length===8&&bytes[0]===0xf0&&bytes[1]===0xd1){
-    extractedCad=bytes[7];
-    extractedRes=bytes[3];
-    parsed=true;
-    parseReason='8b-d1';
-  }
-  // F6 format (less common)
-  else if(bytes.length===5&&bytes[0]===0xf6){
-    extractedCad=(bytes[2]<<8)|bytes[3];
-    extractedRes=bytes[4];
-    parsed=true;
-    parseReason='5b-f6';
-  }
-  
-  if(!parsed)return;
-  
-  // Skip zero-data status packets
-  if(extractedCad===0&&extractedRes===0&&parseReason.includes('d1'))return;
-  
-  // Sanity check - cadence should be reasonable RPM (30-200), resistance 0-100
-  if(extractedCad>200||extractedCad<5){log('  ✗ '+parseReason+' cad:'+extractedCad+' unreasonable','info');return;}
-  if(extractedRes>100){log('  ✗ '+parseReason+' res:'+extractedRes+' too high','info');return;}
-  
-  cadence=extractedCad;
-  resistance=extractedRes;
-  lastValidDataTime=Date.now();
-  
-  log('  ✓ '+parseReason+' → cad:'+cadence+' res:'+resistance,'ok');
-  power=cadence>0?Math.round(1.09*Math.pow(cadence,0.967)*Math.pow(Math.max(resistance,1),0.191)):0;
-  const speed=Math.round(cadence*0.38*10)/10;
-  document.getElementById('valCadence').textContent=cadence;
-  document.getElementById('valResistance').textContent=resistance;
-  document.getElementById('valPower').textContent=power;
-  document.getElementById('valSpeed').innerHTML=speed.toFixed(1)+'<span class="sm-unit"> mph</span>';
-  totalDist+=(speed/3600)*(1/10);
-  document.getElementById('valDist').innerHTML=totalDist.toFixed(2)+'<span class="sm-unit"> mi</span>';
-  pushLiveChart(cadence,resistance);
-  currentSessionData.push({t:Date.now(),c:cadence,r:resistance,p:power,s:speed});
 }
 function onDisconnected(){ 
   isConnected=false; 
   setBleState('idle'); 
   clearInterval(timerInt);
   if(blePollingInterval){clearInterval(blePollingInterval);blePollingInterval=null;}
-  log('Bike disconnected.','err'); 
+  if(bleChar){
+    try{bleChar.removeEventListener('characteristicvaluechanged',handleBLEData);}catch(e){}
+  }
+  log('Bike disconnected. Try reconnecting.','err'); 
   document.getElementById('liveSubtitle').textContent='Connect your bike to start tracking'; 
 }
 function disconnectBike(){ 
