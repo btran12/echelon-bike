@@ -615,21 +615,10 @@ async function handleConnectClick(){
     
     bleChar.addEventListener('characteristicvaluechanged',handleBLEData);
     
-    // Start polling as fallback, but only if we're not getting notifications
-    // Use much longer interval (500ms) to avoid overwhelming the device
+    // Don't poll - notifications are working fine and polling causes disconnections
     if(blePollingInterval)clearInterval(blePollingInterval);
-    lastValidDataTime=Date.now();
-    blePollingInterval=setInterval(async ()=>{
-      if(!bleChar || !isConnected)return;
-      // If we got data in last 2 seconds, skip polling (notifications working)
-      const timeSinceData=Date.now()-lastValidDataTime;
-      if(timeSinceData<2000)return;
-      try{
-        const value=await bleChar.readValue();
-        handleBLEData({target:{value}});
-      }catch(e){}
-    },500);
-    log('Polling started (500ms interval, adaptive).','info');
+    blePollingInterval=null;
+    log('Using notifications only (no polling).','info');
     
     if(foundWriteChar){
       bleWriteChar=foundWriteChar;
@@ -653,7 +642,7 @@ async function handleConnectClick(){
 function handleBLEData(event){
   const bytes=new Uint8Array(event.target.value.buffer);
   const hexStr=Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join(' ');
-  if(rawByteLogCount<10){
+  if(rawByteLogCount<15){
     const byteInfo=[];
     for(let i=0;i<Math.min(8,bytes.length);i++){
       byteInfo.push(`[${i}]=0x${bytes[i].toString(16).padStart(2,'0')}(${bytes[i]})`);
@@ -661,67 +650,58 @@ function handleBLEData(event){
     log('RAW ['+bytes.length+'b]: '+hexStr+'  '+byteInfo.join(' '),'data');
     rawByteLogCount++;
   }
-  if(bytes.length<4){log('  → rejected: too short (<4 bytes)','info');return;}
+  if(bytes.length<3)return;
   
   let parsed=false,parseReason='',extractedCad=0,extractedRes=0;
   
   // Sport 030107 8-byte format: f0 e0 ...
-  // f0 e0 33 69 57 56 12 2b → cad:[2]=0x33=51, res:[3]&0x1F=0x69&0x1F=9
   if(bytes.length===8&&bytes[0]===0xf0&&bytes[1]===0xe0){
     extractedCad=bytes[2];
     extractedRes=bytes[3]&0x1F;
-    if(extractedRes===0 && bytes[4]<=32){
-      extractedRes=bytes[4];
-    }
-    if(extractedRes===0 || extractedRes>32){
-      extractedRes=bytes[5]&0x1F;
-    }
     parsed=true;
-    parseReason='Sport8b (cad=[2], res=[3]&0x1F)';
+    parseReason='8b-f0e0';
   }
-  // 5-byte format: f0 d2 01 12 d5 → cad:[3], res:[2]
+  // 5-byte format: f0 d2 [res] [cad] ...
   else if(bytes.length===5&&bytes[0]===0xf0&&bytes[1]===0xd2){
     extractedCad=bytes[3];
     extractedRes=bytes[2];
     parsed=true;
-    parseReason='5byte F0D2 (cad=[3], res=[2])';
+    parseReason='5b-f0d2';
   }
-  // Standard D1 format (13-byte): f0 d1 09 00 00 00...
-  else if(bytes[1]===0xd1&&bytes.length>=10){
+  // 13-byte D1 format
+  else if(bytes.length>=10&&bytes[0]===0xf0&&bytes[1]===0xd1){
     extractedCad=bytes[9];
     extractedRes=bytes[3];
     parsed=true;
-    parseReason='Pattern D1 (10b)';
+    parseReason='13b-d1';
   }
-  else if(bytes[1]===0xd1&&bytes.length>=8){
+  // 8-byte D1 format
+  else if(bytes.length===8&&bytes[0]===0xf0&&bytes[1]===0xd1){
     extractedCad=bytes[7];
     extractedRes=bytes[3];
     parsed=true;
-    parseReason='Pattern D1 (8b)';
+    parseReason='8b-d1';
   }
-  // F6 format
-  else if(bytes[0]===0xf6&&bytes.length>=5){
+  // F6 format (less common)
+  else if(bytes.length===5&&bytes[0]===0xf6){
     extractedCad=(bytes[2]<<8)|bytes[3];
     extractedRes=bytes[4];
     parsed=true;
-    parseReason='Pattern F6';
+    parseReason='5b-f6';
   }
-  // Note: removed generic F0+ to avoid catching unknown patterns
   
-  if(!parsed){log('  → rejected: no pattern match','info');return;}
+  if(!parsed)return;
   
-  // Validation
-  if(extractedCad>250){log('  → rejected: cadence '+extractedCad+' > 250','info');return;}
-  if(extractedRes>33){log('  → rejected: resistance '+extractedRes+' > 33','info');return;}
+  // Skip zero-data status packets
+  if(extractedCad===0&&extractedRes===0&&parseReason.includes('d1'))return;
+  
+  // Sanity check
+  if(extractedCad>200){log('  ✗ '+parseReason+' cad:'+extractedCad+' too high','info');return;}
+  if(extractedRes>32){log('  ✗ '+parseReason+' res:'+extractedRes+' too high','info');return;}
   
   cadence=extractedCad;
   resistance=extractedRes;
   lastValidDataTime=Date.now();
-  
-  // Skip logging zero/status packets
-  if(cadence===0&&resistance===0&&parseReason.includes('D1')){
-    return;
-  }
   
   log('  ✓ '+parseReason+' → cad:'+cadence+' res:'+resistance,'ok');
   power=cadence>0?Math.round(1.09*Math.pow(cadence,0.967)*Math.pow(Math.max(resistance,1),0.191)):0;
