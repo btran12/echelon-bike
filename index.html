@@ -392,7 +392,7 @@
           <button class="btn danger" onclick="resetLive()">Reset</button>
         </div>
         <div class="log-card">
-          <div class="log-head"><span class="log-head-title">Connection log</span><button class="btn" style="font-size:10px;padding:4px 8px" onclick="clearLog()">Clear</button></div>
+          <div class="log-head"><span class="log-head-title">Connection log</span><button class="btn" style="font-size:10px;padding:4px 8px" onclick="copyLog()">Copy</button><button class="btn" style="font-size:10px;padding:4px 8px" onclick="clearLog()">Clear</button></div>
           <div class="log-body" id="logBody"></div>
         </div>
       </div>
@@ -869,6 +869,15 @@ function log(msg,type='info'){
   b.appendChild(el);b.scrollTop=b.scrollHeight;
 }
 function clearLog(){ document.getElementById('logBody').innerHTML=''; }
+function copyLog(){
+  const logText=document.getElementById('logBody').innerText;
+  if(!logText){log('Log is empty','info');return;}
+  navigator.clipboard.writeText(logText).then(()=>{
+    log('✓ Log copied to clipboard','ok');
+  }).catch(err=>{
+    log('Could not copy: '+err.message,'err');
+  });
+}
 </script>
 </body>
 </html>
