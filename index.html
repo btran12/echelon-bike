@@ -533,22 +533,35 @@ async function handleConnectClick(){
         for(const svc of all){
           log('  Svc: '+svc.uuid,'info');
           const chars=await svc.getCharacteristics();
-          chars.forEach(ch=>{const p=[ch.properties.notify?'N':'',ch.properties.write?'W':'',ch.properties.read?'R':''].filter(Boolean);log('    '+ch.uuid.slice(0,8)+'… ['+p.join('')+']','info');});
+          chars.forEach(ch=>{const p=[ch.properties.notify?'N':'',ch.properties.indicate?'I':'',ch.properties.write?'W':'',ch.properties.writeWithoutResponse?'w':'',ch.properties.read?'R':''].filter(Boolean);log('    '+ch.uuid.slice(0,8)+'… ['+p.join('')+']','info');});
           if(!foundService&&chars.length>=2){foundService=svc;log('  Using this service.','ok');}
         }
       }catch(e2){log('Enum failed: '+e2.message,'err');}
     }
     if(!foundService)throw new Error('No usable service found. Check log.');
     const allChars=await foundService.getCharacteristics();
+    log('Found '+allChars.length+' characteristics in service.','info');
     for(const u of ECHELON_NOTIFY_UUIDS){const m=allChars.find(c=>c.uuid===u&&(c.properties.notify||c.properties.indicate));if(m){foundNotifyChar=m;log('Notify: '+u.slice(0,8)+'…','ok');break;}}
-    if(!foundNotifyChar){foundNotifyChar=allChars.find(c=>c.properties.notify||c.properties.indicate);if(foundNotifyChar)log('Fallback notify: '+foundNotifyChar.uuid.slice(0,8)+'…','ok');}
+    if(!foundNotifyChar){
+      log('No UUID match, trying any notification char…','info');
+      foundNotifyChar=allChars.find(c=>c.properties.notify||c.properties.indicate);
+      if(foundNotifyChar)log('Fallback notify: '+foundNotifyChar.uuid.slice(0,8)+'…','ok');
+    }
+    if(!foundNotifyChar){
+      log('No explicit notify char. Trying any readable char…','info');
+      foundNotifyChar=allChars.find(c=>c.properties.read);
+      if(foundNotifyChar)log('Using readable char: '+foundNotifyChar.uuid.slice(0,8)+'…','info');
+    }
     for(const u of ECHELON_WRITE_UUIDS){const m=allChars.find(c=>c.uuid===u&&(c.properties.write||c.properties.writeWithoutResponse));if(m){foundWriteChar=m;log('Write: '+u.slice(0,8)+'…','ok');break;}}
     if(!foundWriteChar){foundWriteChar=allChars.find(c=>c.properties.write||c.properties.writeWithoutResponse);}
-    if(!foundNotifyChar)throw new Error('No notify characteristic found.');
+    if(!foundNotifyChar)throw new Error('No readable characteristic found. Device may not be compatible.');
     bleChar=foundNotifyChar;
-    await bleChar.startNotifications();
+    try{
+      await bleChar.startNotifications();
+      log('Notifications enabled.','ok');
+    }catch(e){log('Could not start notifications: '+e.message+'. Will try polling.','info');}
     bleChar.addEventListener('characteristicvaluechanged',handleBLEData);
-    if(foundWriteChar){bleWriteChar=foundWriteChar;for(const pkt of ACTIVATION_PACKETS){try{await bleWriteChar.writeValue(pkt);log('Activation sent.','ok');break;}catch{}}}
+    if(foundWriteChar){bleWriteChar=foundWriteChar;for(const pkt of ACTIVATION_PACKETS){try{await bleWriteChar.writeValue(pkt);log('Activation sent.','ok');break;}catch(e){log('Activation failed: '+e.message,'info');}}}
     isConnected=true; setBleState('connected');
     startTime=Date.now(); startTimer();
     document.getElementById('saveSessionBtn').disabled=false;
