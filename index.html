@@ -618,10 +618,16 @@ async function handleConnectClick(){
       bleChar.addEventListener('characteristicvaluechanged',handleBLEData);
     }
     
-    // Don't poll - notifications are working fine and polling causes disconnections
+    // Start gentle polling to request cadence updates
+    // Reading the value periodically may encourage the bike to send 8b packets
     if(blePollingInterval)clearInterval(blePollingInterval);
-    blePollingInterval=null;
-    log('Using notifications only (no polling).','info');
+    blePollingInterval=setInterval(async ()=>{
+      if(!bleChar || !isConnected)return;
+      try{
+        await bleChar.readValue();
+      }catch(e){}
+    },2000);  // Every 2 seconds - very gentle
+    log('Polling enabled (2s interval) to request cadence updates.','info');
     
     if(foundWriteChar){
       bleWriteChar=foundWriteChar;
