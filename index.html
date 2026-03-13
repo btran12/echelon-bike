@@ -519,49 +519,111 @@ async function handleConnectClick(){
   if(!navigator.bluetooth){log('Web Bluetooth not available.','err');return;}
   setBleState('scanning'); log('Requesting Echelon device…','info');
   try{
-    bleDevice=await navigator.bluetooth.requestDevice({filters:[{namePrefix:'ECH'},{namePrefix:'Echelon'},{namePrefix:'ECHEX'}],optionalServices:ECHELON_SERVICES});
+    // Request with ALL possible services as optional to gain access
+    const allOptionalServices=[...ECHELON_SERVICES,'generic_access','generic_attribute','device_information','battery_service','heart_rate'];
+    bleDevice=await navigator.bluetooth.requestDevice({filters:[{namePrefix:'ECH'},{namePrefix:'Echelon'},{namePrefix:'ECHEX'}],optionalServices:allOptionalServices});
     log('Found: '+bleDevice.name,'ok');
     bleDevice.addEventListener('gattserverdisconnected',onDisconnected);
     const server=await bleDevice.gatt.connect();
     log('GATT connected.','info');
     let foundService=null,foundNotifyChar=null,foundWriteChar=null;
-    for(const u of ECHELON_SERVICES){ try{foundService=await server.getPrimaryService(u);log('Service: '+u.slice(0,8)+'…','ok');break;}catch{} }
-    if(!foundService){
-      log('Scanning all services…','info');
+    
+    // Try known service UUIDs first
+    for(const u of ECHELON_SERVICES){ 
       try{
-        const all=await server.getPrimaryServices();
-        for(const svc of all){
-          log('  Svc: '+svc.uuid,'info');
-          const chars=await svc.getCharacteristics();
-          chars.forEach(ch=>{const p=[ch.properties.notify?'N':'',ch.properties.indicate?'I':'',ch.properties.write?'W':'',ch.properties.writeWithoutResponse?'w':'',ch.properties.read?'R':''].filter(Boolean);log('    '+ch.uuid.slice(0,8)+'… ['+p.join('')+']','info');});
-          if(!foundService&&chars.length>=2){foundService=svc;log('  Using this service.','ok');}
+        foundService=await server.getPrimaryService(u);
+        log('Service found: '+u.slice(0,8)+'…','ok');
+        const chars=await foundService.getCharacteristics();
+        if(chars.length>0){
+          log('  Has '+chars.length+' characteristics','ok');
+          break;
+        }else{
+          log('  Service has 0 characteristics, trying next…','info');
+          foundService=null;
         }
-      }catch(e2){log('Enum failed: '+e2.message,'err');}
+      }catch(e){log('  Service '+u.slice(0,8)+'… not available','info');}
     }
-    if(!foundService)throw new Error('No usable service found. Check log.');
+    
+    // If no known service worked, scan ALL services
+    if(!foundService){
+      log('Scanning ALL services on device…','info');
+      try{
+        const allServices=await server.getPrimaryServices();
+        log('Device has '+allServices.length+' services','info');
+        for(const svc of allServices){
+          log('Checking Svc: '+svc.uuid,'info');
+          try{
+            const chars=await svc.getCharacteristics();
+            log('  '+chars.length+' characteristics found','info');
+            chars.forEach(ch=>{
+              const props=[ch.properties.notify?'N':'',ch.properties.indicate?'I':'',ch.properties.write?'W':'',ch.properties.writeWithoutResponse?'w':'',ch.properties.read?'R':''].filter(Boolean);
+              log('    '+ch.uuid.slice(0,8)+'… ['+props.join('')+']','info');
+            });
+            // Pick first service with chars that have read/write/notify properties
+            if(!foundService && chars.some(c=>c.properties.read||c.properties.write||c.properties.writeWithoutResponse||c.properties.notify||c.properties.indicate)){
+              foundService=svc;
+              log('  ✓ Using this service','ok');
+            }
+          }catch(e3){
+            log('  Could not read characteristics: '+e3.message,'info');
+          }
+        }
+      }catch(e2){log('Could not enumerate services: '+e2.message,'err');}
+    }
+    
+    if(!foundService)throw new Error('No service with readable characteristics found.');
+    
     const allChars=await foundService.getCharacteristics();
-    log('Found '+allChars.length+' characteristics in service.','info');
-    for(const u of ECHELON_NOTIFY_UUIDS){const m=allChars.find(c=>c.uuid===u&&(c.properties.notify||c.properties.indicate));if(m){foundNotifyChar=m;log('Notify: '+u.slice(0,8)+'…','ok');break;}}
-    if(!foundNotifyChar){
-      log('No UUID match, trying any notification char…','info');
-      foundNotifyChar=allChars.find(c=>c.properties.notify||c.properties.indicate);
-      if(foundNotifyChar)log('Fallback notify: '+foundNotifyChar.uuid.slice(0,8)+'…','ok');
+    log('Service has '+allChars.length+' total characteristics','info');
+    if(allChars.length===0)throw new Error('Service has no characteristics.');
+    
+    // Characteristic search with progressive fallbacks
+    for(const u of ECHELON_NOTIFY_UUIDS){
+      const m=allChars.find(c=>c.uuid===u&&(c.properties.notify||c.properties.indicate));
+      if(m){foundNotifyChar=m;log('Found notify UUID: '+u.slice(0,8)+'…','ok');break;}
     }
     if(!foundNotifyChar){
-      log('No explicit notify char. Trying any readable char…','info');
+      log('No known UUID match. Trying ANY notify/indicate char…','info');
+      foundNotifyChar=allChars.find(c=>c.properties.notify||c.properties.indicate);
+      if(foundNotifyChar)log('Using notify char: '+foundNotifyChar.uuid.slice(0,8)+'…','ok');
+    }
+    if(!foundNotifyChar){
+      log('No notify char. Trying ANY readable char…','info');
       foundNotifyChar=allChars.find(c=>c.properties.read);
       if(foundNotifyChar)log('Using readable char: '+foundNotifyChar.uuid.slice(0,8)+'…','info');
     }
-    for(const u of ECHELON_WRITE_UUIDS){const m=allChars.find(c=>c.uuid===u&&(c.properties.write||c.properties.writeWithoutResponse));if(m){foundWriteChar=m;log('Write: '+u.slice(0,8)+'…','ok');break;}}
-    if(!foundWriteChar){foundWriteChar=allChars.find(c=>c.properties.write||c.properties.writeWithoutResponse);}
+    
+    // Write characteristic search
+    for(const u of ECHELON_WRITE_UUIDS){
+      const m=allChars.find(c=>c.uuid===u&&(c.properties.write||c.properties.writeWithoutResponse));
+      if(m){foundWriteChar=m;log('Found write UUID: '+u.slice(0,8)+'…','ok');break;}
+    }
+    if(!foundWriteChar){
+      foundWriteChar=allChars.find(c=>c.properties.write||c.properties.writeWithoutResponse);
+      if(foundWriteChar)log('Using write char: '+foundWriteChar.uuid.slice(0,8)+'…','info');
+    }
+    
     if(!foundNotifyChar)throw new Error('No readable characteristic found. Device may not be compatible.');
+    
     bleChar=foundNotifyChar;
     try{
       await bleChar.startNotifications();
       log('Notifications enabled.','ok');
-    }catch(e){log('Could not start notifications: '+e.message+'. Will try polling.','info');}
+    }catch(e){log('Notifications not supported, trying polling: '+e.message,'info');}
+    
     bleChar.addEventListener('characteristicvaluechanged',handleBLEData);
-    if(foundWriteChar){bleWriteChar=foundWriteChar;for(const pkt of ACTIVATION_PACKETS){try{await bleWriteChar.writeValue(pkt);log('Activation sent.','ok');break;}catch(e){log('Activation failed: '+e.message,'info');}}}
+    
+    if(foundWriteChar){
+      bleWriteChar=foundWriteChar;
+      for(const pkt of ACTIVATION_PACKETS){
+        try{
+          await bleWriteChar.writeValue(pkt);
+          log('Activation packet sent.','ok');
+          break;
+        }catch(e){log('Activation failed: '+e.message,'info');}
+      }
+    }
+    
     isConnected=true; setBleState('connected');
     startTime=Date.now(); startTimer();
     document.getElementById('saveSessionBtn').disabled=false;
