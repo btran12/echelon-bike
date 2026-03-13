@@ -579,55 +579,50 @@ async function handleConnectClick(){
     log('Service has '+allChars.length+' total characteristics','info');
     if(allChars.length===0)throw new Error('Service has no characteristics.');
     
-    // Characteristic search with progressive fallbacks
+    // Find ALL characteristics that can notify
+    const notifyChars=[];
     for(const u of ECHELON_NOTIFY_UUIDS){
       const m=allChars.find(c=>c.uuid===u&&(c.properties.notify||c.properties.indicate));
-      if(m){foundNotifyChar=m;log('Found notify UUID: '+u.slice(0,8)+'…','ok');break;}
+      if(m){notifyChars.push(m);log('Found known notify UUID: '+u.slice(0,8)+'…','ok');}
     }
-    if(!foundNotifyChar){
-      log('No known UUID match. Trying ANY notify/indicate char…','info');
-      foundNotifyChar=allChars.find(c=>c.properties.notify||c.properties.indicate);
-      if(foundNotifyChar)log('Using notify char: '+foundNotifyChar.uuid.slice(0,8)+'…','ok');
-    }
-    if(!foundNotifyChar){
-      log('No notify char. Trying ANY readable char…','info');
-      foundNotifyChar=allChars.find(c=>c.properties.read);
-      if(foundNotifyChar)log('Using readable char: '+foundNotifyChar.uuid.slice(0,8)+'…','info');
+    // Also add any other notify/indicate characteristics we find
+    for(const c of allChars){
+      if((c.properties.notify||c.properties.indicate)&&!notifyChars.includes(c)){
+        notifyChars.push(c);
+        log('Found additional notify characteristic: '+c.uuid.slice(0,8)+'…','info');
+      }
     }
     
-    // Write characteristic search
-    for(const u of ECHELON_WRITE_UUIDS){
-      const m=allChars.find(c=>c.uuid===u&&(c.properties.write||c.properties.writeWithoutResponse));
-      if(m){foundWriteChar=m;log('Found write UUID: '+u.slice(0,8)+'…','ok');break;}
-    }
-    if(!foundWriteChar){
-      foundWriteChar=allChars.find(c=>c.properties.write||c.properties.writeWithoutResponse);
-      if(foundWriteChar)log('Using write char: '+foundWriteChar.uuid.slice(0,8)+'…','info');
-    }
+    if(notifyChars.length===0)throw new Error('No readable characteristic found. Device may not be compatible.');
     
-    if(!foundNotifyChar)throw new Error('No readable characteristic found. Device may not be compatible.');
-    
-    bleChar=foundNotifyChar;
-    try{
-      await bleChar.startNotifications();
-      log('Notifications enabled.','ok');
-      bleChar.addEventListener('characteristicvaluechanged',handleBLEData);
-    }catch(e){
-      log('Notifications failed: '+e.message+' (trying without notifications)','warn');
-      // Still add listener in case it works
-      bleChar.addEventListener('characteristicvaluechanged',handleBLEData);
+    // Try all notify characteristics - maybe data comes from multiple streams
+    for(let i=0;i<notifyChars.length;i++){
+      const char=notifyChars[i];
+      try{
+        await char.startNotifications();
+        char.addEventListener('characteristicvaluechanged',handleBLEData);
+        log('Subscribed to characteristic '+i+': '+char.uuid.slice(0,8)+'…','ok');
+      }catch(e){
+        log('Could not subscribe to char '+i+': '+e.message,'info');
+      }
     }
     
-    // Start gentle polling to request cadence updates
-    // Reading the value periodically may encourage the bike to send 8b packets
+    bleChar=notifyChars[0];  // Keep reference to first one
+    
+    // Start very gentle polling to request cadence updates
+    // Longer interval (5s) to avoid overwhelming the device
     if(blePollingInterval)clearInterval(blePollingInterval);
     blePollingInterval=setInterval(async ()=>{
       if(!bleChar || !isConnected)return;
       try{
-        await bleChar.readValue();
-      }catch(e){}
-    },2000);  // Every 2 seconds - very gentle
-    log('Polling enabled (2s interval) to request cadence updates.','info');
+        const val=await bleChar.readValue();
+        // Process the read value through the handler
+        handleBLEData({target:{value:val}});
+      }catch(e){
+        // Silently fail on read errors
+      }
+    },5000);  // Every 5 seconds - very gentle
+    log('Polling enabled (5s interval) for cadence updates.','info');
     
     if(foundWriteChar){
       bleWriteChar=foundWriteChar;
@@ -746,7 +741,10 @@ function onDisconnected(){
   clearInterval(timerInt);
   if(blePollingInterval){clearInterval(blePollingInterval);blePollingInterval=null;}
   if(bleChar){
-    try{bleChar.removeEventListener('characteristicvaluechanged',handleBLEData);}catch(e){}
+    try{
+      bleChar.stopNotifications();
+      bleChar.removeEventListener('characteristicvaluechanged',handleBLEData);
+    }catch(e){}
   }
   log('Bike disconnected. Try reconnecting.','err'); 
   document.getElementById('liveSubtitle').textContent='Connect your bike to start tracking'; 
