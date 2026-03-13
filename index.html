@@ -461,6 +461,7 @@ let awsEndpoint=localStorage.getItem('echelon_aws_endpoint')||'';
 let userId=localStorage.getItem('echelon_user_id')||'rider';
 let sessions=JSON.parse(localStorage.getItem('echelon_sessions')||'[]');
 let bleDevice=null,bleChar=null,bleWriteChar=null,isConnected=false;
+let blePollingInterval=null;
 let cadence=0,resistance=0,power=0,totalDist=0,startTime=null,timerInt=null;
 let currentSessionData=[],rawByteLogCount=0;
 const MAX_PTS=60;
@@ -613,6 +614,17 @@ async function handleConnectClick(){
     
     bleChar.addEventListener('characteristicvaluechanged',handleBLEData);
     
+    // Start polling as fallback if notifications aren't working
+    if(blePollingInterval)clearInterval(blePollingInterval);
+    blePollingInterval=setInterval(async ()=>{
+      if(!bleChar)return;
+      try{
+        const value=await bleChar.readValue();
+        handleBLEData({target:{value}});
+      }catch(e){}
+    },100);
+    log('Polling started (100ms interval).','info');
+    
     if(foundWriteChar){
       bleWriteChar=foundWriteChar;
       for(const pkt of ACTIVATION_PACKETS){
@@ -634,14 +646,21 @@ async function handleConnectClick(){
 
 function handleBLEData(event){
   const bytes=new Uint8Array(event.target.value.buffer);
-  if(rawByteLogCount<5){log('RAW ['+bytes.length+'b]: '+Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join(' '),'data');rawByteLogCount++;}
-  if(bytes.length<4)return;
-  let parsed=false;
-  if(bytes[1]===0xD1&&bytes.length>=10){cadence=bytes[9];resistance=bytes[3];parsed=true;}
-  else if(bytes[1]===0xD1&&bytes.length>=8){cadence=bytes[7];resistance=bytes[3];parsed=true;}
-  else if(bytes[0]===0xF6&&bytes.length>=5){cadence=(bytes[2]<<8)|bytes[3];resistance=bytes[4];parsed=true;}
-  else if(bytes.length>=3&&bytes[0]>=0xF0){cadence=bytes[1];resistance=bytes[2];parsed=true;}
-  if(!parsed||cadence>200||resistance>32)return;
+  const hexStr=Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+  if(rawByteLogCount<10){log('RAW ['+bytes.length+'b]: '+hexStr,'data');rawByteLogCount++;}
+  if(bytes.length<4){log('  → rejected: too short (<4 bytes)','info');return;}
+  let parsed=false,parseReason='';
+  if(bytes[1]===0xD1&&bytes.length>=10){cadence=bytes[9];resistance=bytes[3];parsed=true;parseReason='Pattern D1 (10b)';}
+  else if(bytes[1]===0xD1&&bytes.length>=8){cadence=bytes[7];resistance=bytes[3];parsed=true;parseReason='Pattern D1 (8b)';}
+  else if(bytes[0]===0xF6&&bytes.length>=5){cadence=(bytes[2]<<8)|bytes[3];resistance=bytes[4];parsed=true;parseReason='Pattern F6';}
+  else if(bytes.length>=3&&bytes[0]>=0xF0){cadence=bytes[1];resistance=bytes[2];parsed=true;parseReason='Pattern F0+ generic';}
+  else {log('  → rejected: no pattern match','info');return;}
+  
+  if(!parsed){log('  → rejected: parse failed','info');return;}
+  if(cadence>200){log('  → rejected: cadence '+cadence+' > 200','info');return;}
+  if(resistance>32){log('  → rejected: resistance '+resistance+' > 32','info');return;}
+  
+  log('  ✓ '+parseReason+' → cad:'+cadence+' res:'+resistance,'ok');
   power=cadence>0?Math.round(1.09*Math.pow(cadence,0.967)*Math.pow(Math.max(resistance,1),0.191)):0;
   const speed=Math.round(cadence*0.38*10)/10;
   document.getElementById('valCadence').textContent=cadence;
@@ -653,8 +672,18 @@ function handleBLEData(event){
   pushLiveChart(cadence,resistance);
   currentSessionData.push({t:Date.now(),c:cadence,r:resistance,p:power,s:speed});
 }
-function onDisconnected(){ isConnected=false; setBleState('idle'); clearInterval(timerInt); log('Bike disconnected.','err'); document.getElementById('liveSubtitle').textContent='Connect your bike to start tracking'; }
-function disconnectBike(){ if(bleDevice&&bleDevice.gatt.connected)bleDevice.gatt.disconnect(); }
+function onDisconnected(){ 
+  isConnected=false; 
+  setBleState('idle'); 
+  clearInterval(timerInt);
+  if(blePollingInterval){clearInterval(blePollingInterval);blePollingInterval=null;}
+  log('Bike disconnected.','err'); 
+  document.getElementById('liveSubtitle').textContent='Connect your bike to start tracking'; 
+}
+function disconnectBike(){ 
+  if(blePollingInterval){clearInterval(blePollingInterval);blePollingInterval=null;}
+  if(bleDevice&&bleDevice.gatt.connected)bleDevice.gatt.disconnect(); 
+}
 
 function setBleState(state){
   const btn=document.getElementById('mainConnectBtn'),dot=document.getElementById('bleDot'),txt=document.getElementById('bleStatusText');
