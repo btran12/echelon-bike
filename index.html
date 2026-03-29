@@ -353,6 +353,11 @@
         Connect bike
       </button>
       <div class="ble-status"><div class="ble-dot" id="bleDot"></div><span id="bleStatusText">No device</span></div>
+      <button class="connect-btn" id="cscConnectBtn" onclick="handleCscConnect()" style="margin-top:8px">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>
+        Connect sensor
+      </button>
+      <div class="ble-status"><div class="ble-dot" id="cscDot"></div><span id="cscStatusText">No sensor</span></div>
     </div>
   </aside>
 
@@ -366,6 +371,11 @@
           <div class="page-sub" id="liveSubtitle">Connect your bike to start tracking</div>
         </div>
         <div class="ble-warning" id="bleWarning" style="display:none">Web Bluetooth requires Chrome or Edge on desktop or Android. Safari and Firefox are not supported.</div>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:1rem;padding:10px 14px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-sm)">
+          <div class="ble-dot" id="cscDotPage"></div>
+          <span id="cscStatusPage" style="font-size:12px;font-family:var(--font-mono);color:var(--text2);flex:1">No cadence sensor</span>
+          <button class="btn" id="cscConnectBtnPage" onclick="handleCscConnect()" style="font-size:11px;padding:6px 12px;flex-shrink:0">Connect sensor</button>
+        </div>
         <div class="big-metrics">
           <div class="big-metric green"><div class="bm-label">Cadence</div><div class="bm-val green" id="valCadence">&#8212;</div><div class="bm-unit">RPM</div></div>
           <div class="big-metric blue"><div class="bm-label">Resistance</div><div class="bm-val blue" id="valResistance">&#8212;</div><div class="bm-unit">level / 32</div></div>
@@ -465,6 +475,8 @@ let blePollingInterval=null,bleKeepaliveInterval=null;
 let lastValidDataTime=0;
 let cadence=0,resistance=0,power=0,totalDist=0,startTime=null,timerInt=null;
 let currentSessionData=[],rawByteLogCount=0;
+let cscDevice=null,cscChar=null,cscConnected=false,cscCadence=0;
+let prevCrankRevs=null,prevCrankTime=null;
 const MAX_PTS=60;
 let liveCad=Array(MAX_PTS).fill(null),liveRes=Array(MAX_PTS).fill(null),liveChartInst=null;
 let sessionDetailChartInst=null,currentCalMonth=new Date();
@@ -473,6 +485,13 @@ const ECHELON_SERVICES=['0bf669f0-45f2-11e7-9598-0800200c9a66','0bf669f1-45f2-11
 const ECHELON_NOTIFY_UUIDS=['0bf669f4-45f2-11e7-9598-0800200c9a66','0bf669f2-45f2-11e7-9598-0800200c9a66','0bf669f3-45f2-11e7-9598-0800200c9a66'];
 const ECHELON_WRITE_UUIDS=['0bf669f2-45f2-11e7-9598-0800200c9a66','0bf669f1-45f2-11e7-9598-0800200c9a66','0bf669f3-45f2-11e7-9598-0800200c9a66'];
 const ACTIVATION_PACKETS=[new Uint8Array([0xF0,0xB0,0x01,0x01,0xA2]),new Uint8Array([0xF0,0xB0,0x01,0x00,0xA1])];
+// Standard BLE Cycling Speed & Cadence (CSC) profile UUIDs — used by Magene S3+ and other cadence sensors
+const CSC_SERVICE_UUID=0x1816;
+const CSC_MEASUREMENT_UUID=0x2A5B;
+// CSC time unit: 1/1024 seconds per tick (per BLE CSC spec §3.66)
+const CSC_TIME_RESOLUTION=1024;
+// uint16 rollover boundary for cumulative crank revolution counters and event times
+const UINT16_ROLLOVER=65536;
 
 window.addEventListener('load',()=>{
   if(!navigator.bluetooth) document.getElementById('bleWarning').style.display='block';
@@ -731,17 +750,19 @@ function handleBLEData(event){
     resistance=extractedRes;
     lastValidDataTime=Date.now();
     
-    log('  ✓ '+parseReason+' → cad:'+cadence+' res:'+resistance,'ok');
-    power=cadence>0?Math.round(1.09*Math.pow(cadence,0.967)*Math.pow(Math.max(resistance,1),0.191)):0;
-    const speed=Math.round(cadence*0.38*10)/10;
-    document.getElementById('valCadence').textContent=cadence;
+    // Prefer cadence from the external CSC sensor when it is connected
+    const activeCadence=(cscConnected&&cscCadence>0)?cscCadence:cadence;
+    log('  ✓ '+parseReason+' → cad:'+activeCadence+(cscConnected?' (sensor)':'')+' res:'+resistance,'ok');
+    power=activeCadence>0?Math.round(1.09*Math.pow(activeCadence,0.967)*Math.pow(Math.max(resistance,1),0.191)):0;
+    const speed=Math.round(activeCadence*0.38*10)/10;
+    document.getElementById('valCadence').textContent=activeCadence;
     document.getElementById('valResistance').textContent=resistance;
     document.getElementById('valPower').textContent=power;
     document.getElementById('valSpeed').innerHTML=speed.toFixed(1)+'<span class="sm-unit"> mph</span>';
     totalDist+=(speed/3600)*(1/10);
     document.getElementById('valDist').innerHTML=totalDist.toFixed(2)+'<span class="sm-unit"> mi</span>';
-    pushLiveChart(cadence,resistance);
-    currentSessionData.push({t:Date.now(),c:cadence,r:resistance,p:power,s:speed});
+    pushLiveChart(activeCadence,resistance);
+    currentSessionData.push({t:Date.now(),c:activeCadence,r:resistance,p:power,s:speed});
   }catch(e){
     log('Error processing BLE data: '+e.message,'err');
   }
@@ -765,6 +786,137 @@ function disconnectBike(){
   if(blePollingInterval){clearInterval(blePollingInterval);blePollingInterval=null;}
   if(bleKeepaliveInterval){clearInterval(bleKeepaliveInterval);bleKeepaliveInterval=null;}
   if(bleDevice&&bleDevice.gatt.connected)bleDevice.gatt.disconnect(); 
+}
+
+// ── Magene / BLE CSC Cadence Sensor ──────────────────────────────────────────
+
+async function handleCscConnect(){
+  if(cscConnected){disconnectCsc();return;}
+  if(!navigator.bluetooth){log('Web Bluetooth not available.','err');return;}
+  setCscState('scanning');
+  log('Requesting cadence sensor (BLE CSC)…','info');
+  try{
+    // Filters are OR-ed by the Web Bluetooth API.  The service UUID filter
+    // matches any device that explicitly advertises the CSC service (most
+    // standard cadence sensors).  The name-prefix filters catch Magene
+    // devices whose advertisement packets may not include the service UUID;
+    // getPrimaryService() will still fail gracefully if the selected device
+    // does not actually support CSC.
+    cscDevice=await navigator.bluetooth.requestDevice({
+      filters:[
+        {services:[CSC_SERVICE_UUID]},
+        {namePrefix:'Magene'},
+        {namePrefix:'S3'},
+        {namePrefix:'C3'}
+      ],
+      optionalServices:[CSC_SERVICE_UUID]
+    });
+    log('Found: '+cscDevice.name,'ok');
+    cscDevice.addEventListener('gattserverdisconnected',onCscDisconnected);
+    const server=await cscDevice.gatt.connect();
+    log('CSC GATT connected.','info');
+    const service=await server.getPrimaryService(CSC_SERVICE_UUID);
+    cscChar=await service.getCharacteristic(CSC_MEASUREMENT_UUID);
+    await cscChar.startNotifications();
+    cscChar.addEventListener('characteristicvaluechanged',handleCSCData);
+    prevCrankRevs=null;prevCrankTime=null;cscCadence=0;
+    cscConnected=true;
+    setCscState('connected');
+    if(!startTime){startTime=Date.now();startTimer();}
+    document.getElementById('saveSessionBtn').disabled=false;
+    log('Cadence sensor connected! Pedal to start.','ok');
+  }catch(e){
+    log('Sensor error: '+e.message,'err');
+    setCscState('idle');
+  }
+}
+
+function handleCSCData(event){
+  try{
+    const bytes=new Uint8Array(event.target.value.buffer);
+    if(bytes.length<1)return;
+    const flags=bytes[0];
+    const wheelPresent=(flags&0x01)!==0;
+    const crankPresent=(flags&0x02)!==0;
+    if(!crankPresent)return; // cadence sensor must provide crank data
+    let offset=1;
+    if(wheelPresent)offset+=6; // skip 4-byte wheel revs + 2-byte wheel event time
+    if(bytes.length<offset+4)return;
+    // Cumulative crank revolutions (uint16 LE) and last crank event time (uint16 LE, 1/1024 s)
+    const cumCrankRevs=(bytes[offset])|(bytes[offset+1]<<8);
+    const crankEventTime=(bytes[offset+2])|(bytes[offset+3]<<8);
+    if(prevCrankRevs!==null&&prevCrankTime!==null){
+      let revDiff=cumCrankRevs-prevCrankRevs;
+      if(revDiff<0)revDiff+=UINT16_ROLLOVER; // handle uint16 rollover
+      let timeDiff=crankEventTime-prevCrankTime;
+      if(timeDiff<0)timeDiff+=UINT16_ROLLOVER; // handle uint16 rollover
+      if(timeDiff===0&&revDiff===0){
+        // No new crank event — user has stopped pedaling
+        cscCadence=0;
+      }else if(timeDiff>0){
+        // RPM = revolutions per minute; time is in CSC_TIME_RESOLUTION ticks/second
+        const rpm=Math.round(revDiff*CSC_TIME_RESOLUTION*60/timeDiff);
+        if(rpm>=0&&rpm<=200)cscCadence=rpm;
+      }
+      log('  ✓ CSC → cad:'+cscCadence+' RPM','ok');
+      lastValidDataTime=Date.now();
+      // When the bike is NOT connected the CSC sensor drives all metrics
+      if(!isConnected){
+        power=cscCadence>0?Math.round(1.09*Math.pow(cscCadence,0.967)*Math.pow(Math.max(resistance,1),0.191)):0;
+        const speed=Math.round(cscCadence*0.38*10)/10;
+        document.getElementById('valCadence').textContent=cscCadence;
+        document.getElementById('valPower').textContent=power;
+        document.getElementById('valSpeed').innerHTML=speed.toFixed(1)+'<span class="sm-unit"> mph</span>';
+        totalDist+=(speed/3600)*(1/10);
+        document.getElementById('valDist').innerHTML=totalDist.toFixed(2)+'<span class="sm-unit"> mi</span>';
+        pushLiveChart(cscCadence,resistance);
+        currentSessionData.push({t:Date.now(),c:cscCadence,r:resistance,p:power,s:speed});
+      }
+      // When bike IS connected, handleBLEData already reads cscCadence and updates display
+    }
+    prevCrankRevs=cumCrankRevs;
+    prevCrankTime=crankEventTime;
+  }catch(e){
+    log('Error processing CSC data: '+e.message,'err');
+  }
+}
+
+function onCscDisconnected(){
+  cscConnected=false;cscCadence=0;
+  setCscState('idle');
+  if(cscChar){
+    try{cscChar.removeEventListener('characteristicvaluechanged',handleCSCData);}catch(e){}
+  }
+  log('Cadence sensor disconnected.','err');
+}
+
+function disconnectCsc(){
+  if(cscDevice&&cscDevice.gatt.connected)cscDevice.gatt.disconnect();
+}
+
+function setCscState(state){
+  // Sidebar elements (desktop)
+  const btn=document.getElementById('cscConnectBtn');
+  const dot=document.getElementById('cscDot');
+  const txt=document.getElementById('cscStatusText');
+  // Live-page elements (mobile + desktop)
+  const btnP=document.getElementById('cscConnectBtnPage');
+  const dotP=document.getElementById('cscDotPage');
+  const txtP=document.getElementById('cscStatusPage');
+  if(state==='idle'){
+    btn.className='connect-btn';
+    btn.innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg> Connect sensor';
+    dot.className='ble-dot';txt.textContent='No sensor';
+    btnP.textContent='Connect sensor';dotP.className='ble-dot';txtP.textContent='No cadence sensor';
+  }else if(state==='scanning'){
+    btn.className='connect-btn scanning';btn.textContent='Scanning…';
+    dot.className='ble-dot yellow';txt.textContent='Scanning…';
+    btnP.textContent='Scanning…';dotP.className='ble-dot yellow';txtP.textContent='Scanning for sensor…';
+  }else if(state==='connected'){
+    btn.className='connect-btn connected';btn.textContent='Disconnect sensor';
+    dot.className='ble-dot green';txt.textContent=cscDevice.name||'Sensor';
+    btnP.textContent='Disconnect sensor';dotP.className='ble-dot green';txtP.textContent=(cscDevice.name||'Cadence sensor')+' connected';
+  }
 }
 
 function setBleState(state){
@@ -810,7 +962,8 @@ async function saveSession(){
   renderHistory();renderProgress();document.getElementById('saveSessionBtn').disabled=true;
 }
 function resetLive(){
-  currentSessionData=[];totalDist=0;startTime=isConnected?Date.now():null;
+  currentSessionData=[];totalDist=0;startTime=isConnected||cscConnected?Date.now():null;
+  cscCadence=0;prevCrankRevs=null;prevCrankTime=null;
   liveCad=Array(MAX_PTS).fill(null);liveRes=Array(MAX_PTS).fill(null);
   if(liveChartInst){liveChartInst.data.datasets[0].data=[...liveCad];liveChartInst.data.datasets[1].data=[...liveRes];liveChartInst.update('none');}
   ['valCadence','valResistance','valPower'].forEach(id=>document.getElementById(id).textContent='—');
