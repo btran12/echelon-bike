@@ -628,48 +628,60 @@ async function handleConnectClick(){
     
     bleChar=notifyChars[0];  // Keep reference to first one
     
-    // Start keep-alive interval to prevent bike disconnect
-    // Send periodic activation packets to show we're active
+    // Find write characteristic for activation and keep-alive packets
+    // Search current service first, then ALL services if not found
+    if(!foundWriteChar){
+      for(const u of ECHELON_WRITE_UUIDS){
+        const m=allChars.find(c=>c.uuid===u&&(c.properties.write||c.properties.writeWithoutResponse));
+        if(m){foundWriteChar=m;log('Write char found in current service: '+u.slice(0,8)+'…','ok');break;}
+      }
+    }
+    if(!foundWriteChar){
+      log('Write char not in current service, searching all services…','info');
+      try{
+        const allSvcs=await server.getPrimaryServices();
+        for(const svc of allSvcs){
+          if(svc===foundService) continue;
+          try{
+            const svcChars=await svc.getCharacteristics();
+            for(const u of ECHELON_WRITE_UUIDS){
+              const m=svcChars.find(c=>c.uuid===u&&(c.properties.write||c.properties.writeWithoutResponse));
+              if(m){foundWriteChar=m;log('Write char found in service '+svc.uuid.slice(0,8)+'…: '+u.slice(0,8)+'…','ok');break;}
+            }
+            if(foundWriteChar) break;
+          }catch(e){}
+        }
+      }catch(e){log('Could not search other services: '+e.message,'info');}
+    }
+    if(foundWriteChar){
+      bleWriteChar=foundWriteChar;
+      // Send BOTH activation packets in sequence (required by many Echelon models)
+      for(const pkt of ACTIVATION_PACKETS){
+        try{
+          await bleWriteChar.writeValue(pkt);
+          log('Activation packet sent: '+Array.from(pkt).map(b=>b.toString(16).padStart(2,'0')).join(' '),'ok');
+        }catch(e){
+          log('Activation packet failed: '+e.message,'info');
+        }
+      }
+    }else{
+      log('No write characteristic found - bike may disconnect after timeout.','err');
+    }
+    
+    // Start keep-alive interval to prevent bike's ~60s inactivity timeout
     if(bleKeepaliveInterval)clearInterval(bleKeepaliveInterval);
     bleKeepaliveInterval=setInterval(async ()=>{
       if(!bleWriteChar || !isConnected)return;
       try{
-        // Send first activation packet to maintain connection
-        await bleWriteChar.writeValue(ACTIVATION_PACKETS[0]);
-        log('[KeepAlive] Sent to maintain connection','debug');
-      }catch(e){
-        // Connection lost - will be handled by gattserverdisconnected event
-      }
-    },30000);  // Every 30 seconds
-    log('Keep-alive enabled (30s interval).','info');
-    
-    // Find write characteristic for keep-alive packets
-    if(!foundWriteChar){
-      for(const u of ECHELON_WRITE_UUIDS){
-        const m=allChars.find(c=>c.uuid===u&&(c.properties.write||c.properties.writeWithoutResponse));
-        if(m){foundWriteChar=m;break;}
-      }
-    }
-    if(foundWriteChar){
-      bleWriteChar=foundWriteChar;
-      // Send initial activation packet
-      let activationSent=false;
-      for(const pkt of ACTIVATION_PACKETS){
-        try{
+        for(const pkt of ACTIVATION_PACKETS){
           await bleWriteChar.writeValue(pkt);
-          log('Initial activation packet sent.','ok');
-          activationSent=true;
-          break;
-        }catch(e){
-          log('Activation attempt failed: '+e.message,'info');
         }
+        log('[KeepAlive] Sent','info');
+      }catch(e){
+        log('[KeepAlive] Failed: '+e.message,'err');
       }
-      if(!activationSent){
-        log('Activation packets failed, but will retry via keep-alive.','info');
-      }
-    }else{
-      log('No write characteristic found - keep-alive may not work.','warn');
-    }
+    },15000);  // Every 15 seconds (well within the ~60s timeout)
+    log('Keep-alive enabled (15s interval).','info');
     
     isConnected=true; setBleState('connected');
     startTime=Date.now(); startTimer();
