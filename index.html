@@ -614,21 +614,9 @@ async function handleConnectClick(){
     
     if(notifyChars.length===0)throw new Error('No readable characteristic found. Device may not be compatible.');
     
-    // Try all notify characteristics - maybe data comes from multiple streams
-    for(let i=0;i<notifyChars.length;i++){
-      const char=notifyChars[i];
-      try{
-        await char.startNotifications();
-        char.addEventListener('characteristicvaluechanged',handleBLEData);
-        log('Subscribed to characteristic '+i+': '+char.uuid.slice(0,8)+'…','ok');
-      }catch(e){
-        log('Could not subscribe to char '+i+': '+e.message,'info');
-      }
-    }
-    
     bleChar=notifyChars[0];  // Keep reference to first one
     
-    // Find write characteristic for activation and keep-alive packets
+    // ── STEP 1: Find write characteristic FIRST (needed for activation) ──
     // Search current service first, then ALL services if not found
     if(!foundWriteChar){
       for(const u of ECHELON_WRITE_UUIDS){
@@ -653,34 +641,57 @@ async function handleConnectClick(){
         }
       }catch(e){log('Could not search other services: '+e.message,'info');}
     }
+    
+    // Helper: write using the correct method for the characteristic
+    async function bleWrite(char,data){
+      if(char.properties.writeWithoutResponse){
+        await char.writeValueWithoutResponse(data);
+      }else{
+        await char.writeValueWithResponse(data);
+      }
+    }
+    
+    // ── STEP 2: Send activation packets BEFORE subscribing to notifications ──
+    // The bike won't stream data until it receives these packets
     if(foundWriteChar){
       bleWriteChar=foundWriteChar;
-      // Send BOTH activation packets in sequence (required by many Echelon models)
       for(const pkt of ACTIVATION_PACKETS){
         try{
-          await bleWriteChar.writeValue(pkt);
+          await bleWrite(bleWriteChar,pkt);
           log('Activation packet sent: '+Array.from(pkt).map(b=>b.toString(16).padStart(2,'0')).join(' '),'ok');
         }catch(e){
           log('Activation packet failed: '+e.message,'info');
         }
       }
     }else{
-      log('No write characteristic found - bike may disconnect after timeout.','err');
+      log('No write characteristic found - bike will not stream data.','err');
     }
     
-    // Start keep-alive interval to prevent bike's ~60s inactivity timeout
+    // ── STEP 3: NOW subscribe to notifications (bike is activated) ──
+    for(let i=0;i<notifyChars.length;i++){
+      const char=notifyChars[i];
+      try{
+        await char.startNotifications();
+        char.addEventListener('characteristicvaluechanged',handleBLEData);
+        log('Subscribed to characteristic '+i+': '+char.uuid.slice(0,8)+'…','ok');
+      }catch(e){
+        log('Could not subscribe to char '+i+': '+e.message,'info');
+      }
+    }
+    
+    // ── STEP 4: Keep-alive to prevent bike's ~60s inactivity timeout ──
     if(bleKeepaliveInterval)clearInterval(bleKeepaliveInterval);
     bleKeepaliveInterval=setInterval(async ()=>{
       if(!bleWriteChar || !isConnected)return;
       try{
         for(const pkt of ACTIVATION_PACKETS){
-          await bleWriteChar.writeValue(pkt);
+          await bleWrite(bleWriteChar,pkt);
         }
         log('[KeepAlive] Sent','info');
       }catch(e){
         log('[KeepAlive] Failed: '+e.message,'err');
       }
-    },15000);  // Every 15 seconds (well within the ~60s timeout)
+    },15000);
     log('Keep-alive enabled (15s interval).','info');
     
     isConnected=true; setBleState('connected');
@@ -749,13 +760,16 @@ function handleBLEData(event){
       parseReason='5b-f6';
     }
     
-    if(!parsed)return;
+    if(!parsed){
+      if(rawByteLogCount<=100) log('  ? Unrecognized format ['+bytes.length+'b] hdr:0x'+bytes[0].toString(16)+' 0x'+bytes[1].toString(16),'info');
+      return;
+    }
     
-    // Skip zero-data status packets
+    // Skip zero-data status packets (only for d1 format which sends periodic zeros)
     if(extractedCad===0&&extractedRes===0&&parseReason.includes('d1'))return;
     
-    // Sanity check - cadence should be reasonable RPM (30-200), resistance 0-100
-    if(extractedCad>200||extractedCad<5){log('  ✗ '+parseReason+' cad:'+extractedCad+' unreasonable','info');return;}
+    // Sanity check - cadence 0 is valid (not pedaling), cap at 200
+    if(extractedCad>200){log('  ✗ '+parseReason+' cad:'+extractedCad+' too high','info');return;}
     if(extractedRes>100){log('  ✗ '+parseReason+' res:'+extractedRes+' too high','info');return;}
     
     cadence=extractedCad;
