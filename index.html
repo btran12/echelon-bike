@@ -358,6 +358,10 @@
         Connect sensor
       </button>
       <div class="ble-status"><div class="ble-dot" id="cscDot"></div><span id="cscStatusText">No sensor</span></div>
+      <div style="display:flex;gap:4px;margin-top:6px">
+        <button class="btn primary" id="modeCadBtn" onclick="setCscMode('cadence')" style="flex:1;font-size:10px;padding:5px 0">Cadence</button>
+        <button class="btn" id="modeSpdBtn" onclick="setCscMode('speed')" style="flex:1;font-size:10px;padding:5px 0">Speed</button>
+      </div>
     </div>
   </aside>
 
@@ -374,6 +378,7 @@
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:1rem;padding:10px 14px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-sm)">
           <div class="ble-dot" id="cscDotPage"></div>
           <span id="cscStatusPage" style="font-size:12px;font-family:var(--font-mono);color:var(--text2);flex:1">No cadence sensor</span>
+          <button class="btn" id="modeBtnPage" onclick="setCscMode(cscMode==='cadence'?'speed':'cadence')" style="font-size:10px;padding:5px 10px;flex-shrink:0">Mode: Cadence</button>
           <button class="btn" id="cscConnectBtnPage" onclick="handleCscConnect()" style="font-size:11px;padding:6px 12px;flex-shrink:0">Connect sensor</button>
         </div>
         <div class="big-metrics">
@@ -477,6 +482,7 @@ let cadence=0,resistance=0,power=0,totalDist=0,startTime=null,timerInt=null;
 let currentSessionData=[],rawByteLogCount=0;
 let cscDevice=null,cscChar=null,cscConnected=false,cscCadence=0;
 let prevCrankRevs=null,prevCrankTime=null;
+let cscMode='cadence'; // 'cadence' or 'speed' — user-selectable
 const MAX_PTS=60;
 let liveCad=Array(MAX_PTS).fill(null),liveRes=Array(MAX_PTS).fill(null),liveChartInst=null;
 let sessionDetailChartInst=null,currentCalMonth=new Date();
@@ -496,8 +502,8 @@ const UINT32_ROLLOVER=4294967296;
 
 window.addEventListener('load',()=>{
   if(!navigator.bluetooth) document.getElementById('bleWarning').style.display='block';
-  if(!awsEndpoint) document.getElementById('awsModal').classList.remove('hidden');
-  else { updateAWSIndicator(true); syncFromAWS(); }
+  if(awsEndpoint){ updateAWSIndicator(true); syncFromAWS(); }
+  else { updateAWSIndicator(false); }
   initLiveChart(); renderHistory(); renderProgress();
   log('App ready. Tap Connect to begin.','info');
 });
@@ -873,43 +879,61 @@ function handleCSCData(event){
     let cumRevs=null,eventTime=null;
     let offset=1;
     
-    // Many cadence-only sensors (e.g. Magene) report crank rotations
-    // in the wheel revolution field (flags=0x01) instead of the crank
-    // field (flags=0x02). Handle both cases.
-    if(wheelPresent&&!crankPresent){
-      // Wheel-only packet: treat wheel revolutions as crank revolutions
+    // The sensor sends flags=0x01 (wheel data) in both cadence and speed
+    // mode. In cadence mode each "wheel rev" = one crank revolution.
+    // In speed mode each wheel rev = one wheel revolution (needs
+    // circumference to compute speed). The crank field (flags=0x02) is
+    // used by combo sensors that report both.
+    if(wheelPresent){
       if(bytes.length<7){log('  Packet too short for wheel data','info');return;}
       cumRevs=dv.getUint32(1,true);    // uint32 LE cumulative wheel revs
       eventTime=dv.getUint16(5,true);   // uint16 LE last wheel event time (1/1024s)
-      log('  wheel-as-crank: revs='+cumRevs+' eventTime='+eventTime,'data');
-    }else if(crankPresent){
-      if(wheelPresent) offset+=6; // skip wheel data
-      if(bytes.length<offset+4){log('  Packet too short for crank data','info');return;}
-      cumRevs=dv.getUint16(offset,true);     // uint16 LE cumulative crank revs
-      eventTime=dv.getUint16(offset+2,true); // uint16 LE last crank event time (1/1024s)
-      log('  crank: revs='+cumRevs+' eventTime='+eventTime,'data');
-    }else{
-      log('  No wheel or crank data, skipping','info');
-      return;
+      log('  wheel: revs='+cumRevs+' eventTime='+eventTime+' mode='+cscMode,'data');
     }
+    if(crankPresent){
+      if(wheelPresent) offset+=6;
+      if(bytes.length<offset+4){log('  Packet too short for crank data','info');return;}
+      // When crank field is present, always use it for cadence
+      cumRevs=dv.getUint16(offset,true);
+      eventTime=dv.getUint16(offset+2,true);
+      cscMode='cadence'; // sensor has native crank data, override mode
+      log('  crank: revs='+cumRevs+' eventTime='+eventTime,'data');
+    }
+    if(cumRevs===null){log('  No rev data, skipping','info');return;}
 
     if(prevCrankRevs!==null&&prevCrankTime!==null){
       let revDiff=cumRevs-prevCrankRevs;
-      if(revDiff<0)revDiff+=(wheelPresent&&!crankPresent)?UINT32_ROLLOVER:UINT16_ROLLOVER;
+      if(revDiff<0)revDiff+=(!crankPresent)?UINT32_ROLLOVER:UINT16_ROLLOVER;
       let timeDiff=eventTime-prevCrankTime;
       if(timeDiff<0)timeDiff+=UINT16_ROLLOVER;
+
+      let computedSpeed=0;
       if(timeDiff===0&&revDiff===0){
         cscCadence=0;
+        computedSpeed=0;
       }else if(timeDiff>0){
         const rpm=Math.round(revDiff*CSC_TIME_RESOLUTION*60/timeDiff);
-        if(rpm>=0&&rpm<=200)cscCadence=rpm;
+        if(cscMode==='cadence'){
+          // Wheel field = crank revolutions
+          if(rpm>=0&&rpm<=200)cscCadence=rpm;
+          log('  ✓ CSC cadence → '+cscCadence+' RPM','ok');
+        }else{
+          // Speed mode: wheel field = actual wheel revolutions
+          // Compute speed from wheel circumference (2.105m ≈ 700x25c)
+          const WHEEL_CIRCUMFERENCE_M=2.105;
+          const revsPerSec=revDiff*CSC_TIME_RESOLUTION/timeDiff;
+          computedSpeed=Math.round(revsPerSec*WHEEL_CIRCUMFERENCE_M*3600/1609.34*10)/10; // mph
+          // Derive cadence from speed using the bike's ratio (inverse of 0.38)
+          cscCadence=Math.round(computedSpeed/0.38);
+          if(cscCadence>200)cscCadence=200;
+          log('  ✓ CSC speed → '+computedSpeed+' mph (derived cad:'+cscCadence+')','ok');
+        }
       }
-      log('  ✓ CSC → cad:'+cscCadence+' RPM','ok');
       lastValidDataTime=Date.now();
       // When the bike is NOT connected the CSC sensor drives all metrics
       if(!isConnected){
         power=cscCadence>0?Math.round(1.09*Math.pow(cscCadence,0.967)*Math.pow(Math.max(resistance,1),0.191)):0;
-        const speed=Math.round(cscCadence*0.38*10)/10;
+        const speed=(cscMode==='speed'&&computedSpeed>0)?computedSpeed:Math.round(cscCadence*0.38*10)/10;
         document.getElementById('valCadence').textContent=cscCadence;
         document.getElementById('valPower').textContent=power;
         document.getElementById('valSpeed').innerHTML=speed.toFixed(1)+'<span class="sm-unit"> mph</span>';
@@ -938,6 +962,21 @@ function onCscDisconnected(){
 
 function disconnectCsc(){
   if(cscDevice&&cscDevice.gatt.connected)cscDevice.gatt.disconnect();
+}
+
+function setCscMode(mode){
+  cscMode=mode;
+  // Reset accumulators when switching modes to avoid spikes
+  prevCrankRevs=null;prevCrankTime=null;
+  // Update sidebar toggle buttons
+  const cadBtn=document.getElementById('modeCadBtn');
+  const spdBtn=document.getElementById('modeSpdBtn');
+  if(cadBtn){cadBtn.className=mode==='cadence'?'btn primary':'btn';}
+  if(spdBtn){spdBtn.className=mode==='speed'?'btn primary':'btn';}
+  // Update live page toggle
+  const pageBtn=document.getElementById('modeBtnPage');
+  if(pageBtn){pageBtn.textContent='Mode: '+(mode==='cadence'?'Cadence':'Speed');}
+  log('Sensor mode set to: '+mode,'ok');
 }
 
 function setCscState(state){
