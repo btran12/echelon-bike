@@ -492,6 +492,7 @@ const CSC_MEASUREMENT_UUID=0x2A5B;
 const CSC_TIME_RESOLUTION=1024;
 // uint16 rollover boundary for cumulative crank revolution counters and event times
 const UINT16_ROLLOVER=65536;
+const UINT32_ROLLOVER=4294967296;
 
 window.addEventListener('load',()=>{
   if(!navigator.bluetooth) document.getElementById('bleWarning').style.display='block';
@@ -868,30 +869,38 @@ function handleCSCData(event){
     const wheelPresent=(flags&0x01)!==0;
     const crankPresent=(flags&0x02)!==0;
     log('  flags=0x'+flags.toString(16)+' wheel='+wheelPresent+' crank='+crankPresent,'data');
-    if(!crankPresent){log('  No crank data in packet, skipping','info');return;}
+    
+    let cumRevs=null,eventTime=null;
     let offset=1;
-    if(wheelPresent){
-      if(bytes.length>=7){
-        const wheelRevs=dv.getUint32(1,true);
-        const wheelTime=dv.getUint16(5,true);
-        log('  wheel: revs='+wheelRevs+' time='+wheelTime,'data');
-      }
-      offset+=6;
+    
+    // Many cadence-only sensors (e.g. Magene) report crank rotations
+    // in the wheel revolution field (flags=0x01) instead of the crank
+    // field (flags=0x02). Handle both cases.
+    if(wheelPresent&&!crankPresent){
+      // Wheel-only packet: treat wheel revolutions as crank revolutions
+      if(bytes.length<7){log('  Packet too short for wheel data','info');return;}
+      cumRevs=dv.getUint32(1,true);    // uint32 LE cumulative wheel revs
+      eventTime=dv.getUint16(5,true);   // uint16 LE last wheel event time (1/1024s)
+      log('  wheel-as-crank: revs='+cumRevs+' eventTime='+eventTime,'data');
+    }else if(crankPresent){
+      if(wheelPresent) offset+=6; // skip wheel data
+      if(bytes.length<offset+4){log('  Packet too short for crank data','info');return;}
+      cumRevs=dv.getUint16(offset,true);     // uint16 LE cumulative crank revs
+      eventTime=dv.getUint16(offset+2,true); // uint16 LE last crank event time (1/1024s)
+      log('  crank: revs='+cumRevs+' eventTime='+eventTime,'data');
+    }else{
+      log('  No wheel or crank data, skipping','info');
+      return;
     }
-    if(bytes.length<offset+4){log('  Packet too short for crank data (need '+(offset+4)+', have '+bytes.length+')','info');return;}
-    const cumCrankRevs=dv.getUint16(offset,true);
-    const crankEventTime=dv.getUint16(offset+2,true);
-    log('  crank: revs='+cumCrankRevs+' eventTime='+crankEventTime+' prev=['+prevCrankRevs+','+prevCrankTime+']','data');
+
     if(prevCrankRevs!==null&&prevCrankTime!==null){
-      let revDiff=cumCrankRevs-prevCrankRevs;
-      if(revDiff<0)revDiff+=UINT16_ROLLOVER; // handle uint16 rollover
-      let timeDiff=crankEventTime-prevCrankTime;
-      if(timeDiff<0)timeDiff+=UINT16_ROLLOVER; // handle uint16 rollover
+      let revDiff=cumRevs-prevCrankRevs;
+      if(revDiff<0)revDiff+=(wheelPresent&&!crankPresent)?UINT32_ROLLOVER:UINT16_ROLLOVER;
+      let timeDiff=eventTime-prevCrankTime;
+      if(timeDiff<0)timeDiff+=UINT16_ROLLOVER;
       if(timeDiff===0&&revDiff===0){
-        // No new crank event — user has stopped pedaling
         cscCadence=0;
       }else if(timeDiff>0){
-        // RPM = revolutions per minute; time is in CSC_TIME_RESOLUTION ticks/second
         const rpm=Math.round(revDiff*CSC_TIME_RESOLUTION*60/timeDiff);
         if(rpm>=0&&rpm<=200)cscCadence=rpm;
       }
@@ -911,8 +920,8 @@ function handleCSCData(event){
       }
       // When bike IS connected, handleBLEData already reads cscCadence and updates display
     }
-    prevCrankRevs=cumCrankRevs;
-    prevCrankTime=crankEventTime;
+    prevCrankRevs=cumRevs;
+    prevCrankTime=eventTime;
   }catch(e){
     log('Error processing CSC data: '+e.message,'err');
   }
