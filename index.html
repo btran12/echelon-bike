@@ -859,18 +859,29 @@ async function handleCscConnect(){
 
 function handleCSCData(event){
   try{
-    const bytes=new Uint8Array(event.target.value.buffer);
-    if(bytes.length<1)return;
+    const dv=event.target.value;
+    const bytes=new Uint8Array(dv.buffer);
+    const hexStr=Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+    log('CSC RAW ['+bytes.length+'b]: '+hexStr,'data');
+    if(bytes.length<1){log('CSC packet too short','info');return;}
     const flags=bytes[0];
     const wheelPresent=(flags&0x01)!==0;
     const crankPresent=(flags&0x02)!==0;
-    if(!crankPresent)return; // cadence sensor must provide crank data
+    log('  flags=0x'+flags.toString(16)+' wheel='+wheelPresent+' crank='+crankPresent,'data');
+    if(!crankPresent){log('  No crank data in packet, skipping','info');return;}
     let offset=1;
-    if(wheelPresent)offset+=6; // skip 4-byte wheel revs + 2-byte wheel event time
-    if(bytes.length<offset+4)return;
-    // Cumulative crank revolutions (uint16 LE) and last crank event time (uint16 LE, 1/1024 s)
-    const cumCrankRevs=(bytes[offset])|(bytes[offset+1]<<8);
-    const crankEventTime=(bytes[offset+2])|(bytes[offset+3]<<8);
+    if(wheelPresent){
+      if(bytes.length>=7){
+        const wheelRevs=dv.getUint32(1,true);
+        const wheelTime=dv.getUint16(5,true);
+        log('  wheel: revs='+wheelRevs+' time='+wheelTime,'data');
+      }
+      offset+=6;
+    }
+    if(bytes.length<offset+4){log('  Packet too short for crank data (need '+(offset+4)+', have '+bytes.length+')','info');return;}
+    const cumCrankRevs=dv.getUint16(offset,true);
+    const crankEventTime=dv.getUint16(offset+2,true);
+    log('  crank: revs='+cumCrankRevs+' eventTime='+crankEventTime+' prev=['+prevCrankRevs+','+prevCrankTime+']','data');
     if(prevCrankRevs!==null&&prevCrankTime!==null){
       let revDiff=cumCrankRevs-prevCrankRevs;
       if(revDiff<0)revDiff+=UINT16_ROLLOVER; // handle uint16 rollover
